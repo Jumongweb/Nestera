@@ -600,41 +600,90 @@ export class SavingsService {
     }
 
     const userPublicKey = user.publicKey;
-
     const defaultVaultContractId =
       this.configService.get<string>('stellar.contractId') || null;
 
-    return await Promise.all(
-      subscriptions.map(async (subscription) => {
-        const fallbackAmount = Number(subscription.amount);
-        const vaultContractId =
-          this.resolveVaultContractId(subscription) ?? defaultVaultContractId;
+    // Group subscriptions by vault contract ID for batching
+    const subscriptionsByVault = new Map<string | null, typeof subscriptions>();
+    for (const sub of subscriptions) {
+      const vaultId =
+        this.resolveVaultContractId(sub) ?? defaultVaultContractId;
+      if (!subscriptionsByVault.has(vaultId)) {
+        subscriptionsByVault.set(vaultId, []);
+      }
+      subscriptionsByVault.get(vaultId)!.push(sub);
+    }
 
-        if (!vaultContractId) {
-          return this.mapSubscriptionWithLiveBalance(
-            subscription,
-            fallbackAmount,
-            Math.round(fallbackAmount * STROOPS_PER_XLM),
-            'cache',
-            null,
-          );
-        }
+    // Batch RPC calls per vault contract ID
+    const balancesByContractAndUser = new Map<string, Map<string, number>>();
 
-        const liveBalanceStroops =
-          await this.blockchainSavingsService.getUserVaultBalance(
-            vaultContractId,
-            userPublicKey,
-          );
+    await Promise.all(
+      Array.from(subscriptionsByVault.entries()).map(
+        async ([vaultContractId, vaultSubs]) => {
+          if (!vaultContractId) {
+            return;
+          }
 
+          // Check cache first
+          const cacheKey = `vault_balance:${vaultContractId}:${userPublicKey}`;
+          const cached = await this.cacheManager.get<number>(cacheKey);
+
+          if (cached !== undefined) {
+            if (!balancesByContractAndUser.has(vaultContractId)) {
+              balancesByContractAndUser.set(vaultContractId, new Map());
+            }
+            balancesByContractAndUser
+              .get(vaultContractId)!
+              .set(userPublicKey, cached);
+            return;
+          }
+
+          // Fetch balance and cache it (TTL: 5 minutes)
+          const balance =
+            await this.blockchainSavingsService.getUserVaultBalance(
+              vaultContractId,
+              userPublicKey,
+            );
+
+          await this.cacheManager.set(cacheKey, balance, 5 * 60 * 1000);
+
+          if (!balancesByContractAndUser.has(vaultContractId)) {
+            balancesByContractAndUser.set(vaultContractId, new Map());
+          }
+          balancesByContractAndUser
+            .get(vaultContractId)!
+            .set(userPublicKey, balance);
+        },
+      ),
+    );
+
+    // Map results
+    return subscriptions.map((subscription) => {
+      const vaultContractId =
+        this.resolveVaultContractId(subscription) ?? defaultVaultContractId;
+      const fallbackAmount = Number(subscription.amount);
+
+      if (!vaultContractId) {
         return this.mapSubscriptionWithLiveBalance(
           subscription,
-          this.stroopsToDecimal(liveBalanceStroops),
-          liveBalanceStroops,
-          'rpc',
-          vaultContractId,
+          fallbackAmount,
+          Math.round(fallbackAmount * STROOPS_PER_XLM),
+          'cache',
+          null,
         );
-      }),
-    );
+      }
+
+      const liveBalanceStroops =
+        balancesByContractAndUser.get(vaultContractId)?.get(userPublicKey) ?? 0;
+
+      return this.mapSubscriptionWithLiveBalance(
+        subscription,
+        this.stroopsToDecimal(liveBalanceStroops),
+        liveBalanceStroops,
+        'rpc',
+        vaultContractId,
+      );
+    });
   }
 
   async getProductMetrics(
@@ -1474,7 +1523,7 @@ export class SavingsService {
       );
 
     const earnings = projectedBalance - amount;
-    
+
     // Applying a 1% protocol fee impact as assumed in AdminAnalyticsService
     const netEarnings = earnings * 0.99;
 
