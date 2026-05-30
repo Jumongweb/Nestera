@@ -17,6 +17,7 @@ import {
   ShoppingBag,
 } from "lucide-react";
 import GoalCard, { GoalStatus } from "./components/GoalCard";
+import { Button } from "../components/ui/Button";
 
 // export const metadata = { title: "Goal-Based Savings - Nestera" };
 
@@ -120,9 +121,7 @@ export default function GoalBasedSavingsPage() {
               </p>
             </div>
             <div className="flex items-center gap-3">
-              <button className="px-5 py-2.5 rounded-xl border border-cyan-400/40 text-cyan-200 hover:text-white hover:border-cyan-300 transition-colors">
-                View Templates
-              </button>
+              <Button variant="outline" size="md">View Templates</Button>
               <Link
                 href="/savings/create-goal"
                 className="px-5 py-2.5 bg-cyan-500 hover:bg-cyan-400 text-[#061a1a] font-semibold rounded-xl transition-all shadow-lg active:scale-95 inline-block"
@@ -244,39 +243,36 @@ export default function GoalBasedSavingsPage() {
               <option value="behind-schedule">Behind Schedule</option>
               <option value="paused">Paused</option>
             </select>
-            <button
-              type="button"
+            <Button
+              variant="secondary"
+              size="md"
+              rightIcon={<ChevronDown size={14} className="opacity-70" />}
               onClick={() => setSortBy(sortBy === "Progress" ? "Target" : "Progress")}
-              className="flex items-center gap-2 px-4 py-3 rounded-xl border bg-[#0e2330] border-white/5 text-[#d3ecef] text-sm"
+              className="bg-[#0e2330] border-white/5 text-[#d3ecef]"
             >
               Sort: {sortBy}
-              <ChevronDown size={14} className="opacity-70" />
-            </button>
+            </Button>
 <div className="flex bg-[#0e2330] p-1 rounded-xl border border-white/5" role="group" aria-label="View mode toggle">
-               <button
-                 type="button"
+               <Button
+                 variant="ghost"
+                 size="sm"
                  onClick={() => setViewMode("grid")}
-                 className={`p-2 rounded-lg transition-colors ${viewMode === "grid"
-                   ? "bg-cyan-500/10 text-cyan-400"
-                   : "text-[#5e8c96] hover:text-white"
-                   }`}
+                 className={viewMode === "grid" ? "bg-cyan-500/10 text-cyan-400" : "text-[#5e8c96]"}
                  aria-label="Grid view"
                  aria-pressed={viewMode === "grid"}
                >
                  <LayoutGrid size={18} />
-               </button>
-               <button
-                 type="button"
+               </Button>
+               <Button
+                 variant="ghost"
+                 size="sm"
                  onClick={() => setViewMode("list")}
-                 className={`p-2 rounded-lg transition-colors ${viewMode === "list"
-                   ? "bg-cyan-500/10 text-cyan-400"
-                   : "text-[#5e8c96] hover:text-white"
-                   }`}
+                 className={viewMode === "list" ? "bg-cyan-500/10 text-cyan-400" : "text-[#5e8c96]"}
                  aria-label="List view"
                  aria-pressed={viewMode === "list"}
                >
                  <List size={18} />
-               </button>
+               </Button>
              </div>
           </div>
         </div>

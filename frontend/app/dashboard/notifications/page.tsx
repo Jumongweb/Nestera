@@ -2,6 +2,7 @@
 
 import React, { useState } from "react";
 import { Bell, CheckCheck, ArrowUpRight, ShieldCheck, Target, Megaphone } from "lucide-react";
+import { Button } from "@/app/components/ui/Button";
 
 type NotifType = "transaction" | "governance" | "milestone" | "announcement";
 
@@ -77,31 +78,30 @@ export default function NotificationsPage() {
           </div>
         </div>
         {unread > 0 && (
-          <button
+          <Button
+            variant="outline"
+            size="sm"
+            leftIcon={<CheckCheck size={15} />}
             onClick={markAllRead}
-            className="flex items-center gap-2 px-4 py-2 rounded-xl border border-cyan-500/20 bg-cyan-500/10 text-cyan-300 text-sm font-medium hover:bg-cyan-500/20 transition-colors cursor-pointer"
+            className="border-cyan-500/20 bg-cyan-500/10 text-cyan-300 hover:bg-cyan-500/20"
           >
-            <CheckCheck size={15} />
             Mark all read
-          </button>
+          </Button>
         )}
       </div>
 
       {/* Filters */}
       <div className="flex gap-2 flex-wrap mb-5">
         {FILTERS.map((f) => (
-          <button
+          <Button
             key={f.value}
+            variant={filter === f.value ? "outline" : "ghost"}
+            size="sm"
             onClick={() => setFilter(f.value)}
-            className={[
-              "px-3 py-1.5 rounded-lg text-sm font-medium transition-colors cursor-pointer border",
-              filter === f.value
-                ? "bg-cyan-500/15 border-cyan-500/30 text-cyan-300"
-                : "bg-white/3 border-white/8 text-[#6e9aaa] hover:text-[#b8dfe0]",
-            ].join(" ")}
+            className={filter === f.value ? "border-cyan-500/30 bg-cyan-500/15 text-cyan-300" : "text-[#6e9aaa]"}
           >
             {f.label}
-          </button>
+          </Button>
         ))}
       </div>
 

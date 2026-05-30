@@ -17,6 +17,7 @@ import {
 } from "@stellar/freighter-api";
 import { Horizon } from "@stellar/stellar-sdk";
 import { env } from "../lib/env";
+import { queryClient } from "./QueryProvider";
 
 interface Balance {
   asset_code: string;
@@ -25,6 +26,8 @@ interface Balance {
   asset_issuer?: string;
   usd_value: number;
 }
+
+export type ConnectionStatus = "idle" | "connecting" | "connected" | "disconnected" | "locked" | "error";
 
 interface WalletState {
   address: string | null;
@@ -37,11 +40,13 @@ interface WalletState {
   balances: Balance[];
   totalUsdValue: number;
   lastBalanceSync: number | null;
+  connectionStatus: ConnectionStatus;
 }
 
 interface WalletContextValue extends WalletState {
   connect: () => Promise<void>;
   disconnect: () => void;
+  reconnect: () => Promise<void>;
   fetchBalances: () => Promise<void>;
 }
 
@@ -53,115 +58,166 @@ const COINGECKO_IDS: Record<string, string> = {
   AQUA: "aqua",
 };
 
-export function WalletProvider({ children }: { children: React.ReactNode }) {
-  const [state, setState] = useState<WalletState>({
-    address: null,
-    network: null,
-    isConnected: false,
-    isLoading: false,
-    isBalancesLoading: false,
-    error: null,
-    balanceError: null,
-    balances: [],
-    totalUsdValue: 0,
-    lastBalanceSync: null,
-  });
+const STORAGE_KEY = "nestera_wallet_network";
 
+const INITIAL_STATE: WalletState = {
+  address: null,
+  network: null,
+  isConnected: false,
+  isLoading: false,
+  isBalancesLoading: false,
+  error: null,
+  balanceError: null,
+  balances: [],
+  totalUsdValue: 0,
+  lastBalanceSync: null,
+  connectionStatus: "idle",
+};
+
+export function WalletProvider({ children }: { children: React.ReactNode }) {
+  const [state, setState] = useState<WalletState>(INITIAL_STATE);
   const refreshInterval = useRef<NodeJS.Timeout | null>(null);
   const networkWatcher = useRef<WatchWalletChanges | null>(null);
+  const disconnectCheckInterval = useRef<NodeJS.Timeout | null>(null);
+  const connectTimeoutRef = useRef<NodeJS.Timeout | null>(null);
 
-  const getHorizonUrl = (network: string | null) => {
-    return network?.toLowerCase() === "public"
-      ? env.horizonPublic
-      : env.horizonTestnet;
-  };
+  const getHorizonUrl = (network: string | null) =>
+    network?.toLowerCase() === "public" ? env.horizonPublic : env.horizonTestnet;
 
   const fetchBalances = useCallback(async () => {
-    if (!state.address) return;
+    if (!state.address) {
+      try { queryClient.removeQueries({ queryKey: ["balances"] }); } catch {}
+      return;
+    }
 
     setState((s) => ({ ...s, isBalancesLoading: true, balanceError: null }));
 
     try {
-      const horizonUrl = getHorizonUrl(state.network);
-      const server = new Horizon.Server(horizonUrl);
-      const account = await server.loadAccount(state.address);
+      const result = await queryClient.fetchQuery({
+        queryKey: ["balances", state.address],
+        queryFn: async () => {
+          const horizonUrl = getHorizonUrl(state.network);
+          const server = new Horizon.Server(horizonUrl);
+          const account = await server.loadAccount(state.address);
 
-      // Fetch prices
-      const assetIds = Object.values(COINGECKO_IDS).join(",");
-      const priceRes = await fetch(
-        `${env.coingeckoApi}/simple/price?ids=${assetIds}&vs_currencies=usd`
-      );
-      const prices = await priceRes.json();
+          const assetIds = Object.values(COINGECKO_IDS).join(",");
+          const priceRes = await fetch(
+            `${env.coingeckoApi}/simple/price?ids=${assetIds}&vs_currencies=usd`
+          );
+          const prices = await priceRes.json();
 
-      let totalUsd = 0;
-      const balances: Balance[] = account.balances.map((b: any) => {
-        const code = b.asset_type === "native" ? "XLM" : b.asset_code;
-        const coingeckoId = COINGECKO_IDS[code];
-        const price = prices[coingeckoId]?.usd || (code === "USDC" ? 1 : 0);
-        const usdValue = parseFloat(b.balance) * price;
-        totalUsd += usdValue;
+          let totalUsd = 0;
+          const balances: Balance[] = account.balances.map((b: any) => {
+            const code = b.asset_type === "native" ? "XLM" : b.asset_code;
+            const coingeckoId = COINGECKO_IDS[code];
+            const price = prices[coingeckoId]?.usd || (code === "USDC" ? 1 : 0);
+            const usdValue = parseFloat(b.balance) * price;
+            totalUsd += usdValue;
+            return {
+              asset_code: code,
+              balance: b.balance,
+              asset_type: b.asset_type,
+              asset_issuer: b.asset_issuer,
+              usd_value: usdValue,
+            };
+          });
 
-        return {
-          asset_code: code,
-          balance: b.balance,
-          asset_type: b.asset_type,
-          asset_issuer: b.asset_issuer,
-          usd_value: usdValue,
-        };
+          return { balances, totalUsd };
+        },
+        staleTime: 30_000,
+        cacheTime: 300_000,
       });
 
       setState((s) => ({
         ...s,
-        balances,
-        totalUsdValue: totalUsd,
+        balances: result.balances,
+        totalUsdValue: result.totalUsd,
         isBalancesLoading: false,
         balanceError: null,
         lastBalanceSync: Date.now(),
       }));
     } catch (err) {
-      console.error("Failed to fetch balances:", err);
       setState((s) => ({
         ...s,
         isBalancesLoading: false,
-        balanceError:
-          err instanceof Error ? err.message : "Unable to refresh wallet balances.",
+        balanceError: err instanceof Error ? err.message : "Unable to refresh wallet balances.",
       }));
     }
   }, [state.address, state.network]);
 
   // Restore session on mount
   useEffect(() => {
+    const savedNetwork = typeof window !== "undefined"
+      ? localStorage.getItem(STORAGE_KEY)
+      : null;
+
     (async () => {
       try {
         const connected = await isConnected();
         if (connected?.isConnected) {
-          const [addrResult, netResult] = await Promise.all([
-            getAddress(),
-            getNetwork(),
-          ]);
+          const [addrResult, netResult] = await Promise.all([getAddress(), getNetwork()]);
           if (addrResult?.address) {
+            const network = netResult?.network ?? savedNetwork ?? null;
+            if (network) localStorage.setItem(STORAGE_KEY, network);
             setState((s) => ({
               ...s,
               address: addrResult.address,
-              network: netResult?.network ?? null,
+              network,
               isConnected: true,
-              isLoading: false,
-              error: null,
+              connectionStatus: "connected",
             }));
           }
+        } else {
+          // Was previously connected but now disconnected
+          setState((s) => ({
+            ...s,
+            connectionStatus: savedNetwork ? "disconnected" : "idle",
+          }));
         }
       } catch {
-        // Freighter not installed or not connected — silent fail
+        // Freighter not installed — silent fail
       }
     })();
   }, []);
+
+  // Poll to detect wallet lock/disconnect from extension
+  useEffect(() => {
+    if (!state.isConnected) return;
+
+    disconnectCheckInterval.current = setInterval(async () => {
+      try {
+        const connected = await isConnected();
+        if (!connected?.isConnected) {
+          // Invalidate cached balances and mark as locked so UI prompts reconnect
+          try { queryClient.removeQueries({ queryKey: ["balances"] }); } catch {}
+          setState((s) => ({
+            ...s,
+            isConnected: false,
+            connectionStatus: "locked",
+            address: null,
+            balances: [],
+            totalUsdValue: 0,
+            isBalancesLoading: false,
+            lastBalanceSync: null,
+          }));
+        }
+      } catch {
+        // ignore
+      }
+    }, 5000);
+
+    return () => {
+      if (disconnectCheckInterval.current) {
+        clearInterval(disconnectCheckInterval.current);
+        disconnectCheckInterval.current = null;
+      }
+    };
+  }, [state.isConnected]);
 
   // Fetch balances when address changes
   useEffect(() => {
     if (state.address) {
       fetchBalances();
-
-      // Real-time updates every 30 seconds
       if (refreshInterval.current) clearInterval(refreshInterval.current);
       refreshInterval.current = setInterval(fetchBalances, 30000);
     } else {
@@ -178,108 +234,107 @@ export function WalletProvider({ children }: { children: React.ReactNode }) {
         lastBalanceSync: null,
       }));
     }
-
     return () => {
       if (refreshInterval.current) clearInterval(refreshInterval.current);
     };
   }, [state.address, fetchBalances]);
 
-  // Watch for network changes when wallet is connected
+  // Watch for network changes
   useEffect(() => {
     if (!state.isConnected) {
-      // Clean up watcher when wallet is disconnected
       if (networkWatcher.current) {
-        try {
-          networkWatcher.current.stop();
-        } catch (error) {
-          console.error("Error stopping network watcher:", error);
-        }
+        try { networkWatcher.current.stop(); } catch {}
         networkWatcher.current = null;
       }
       return;
     }
 
     try {
-      // Initialize watcher to poll every 3 seconds
       networkWatcher.current = new WatchWalletChanges(3000);
-
       networkWatcher.current.watch((changes) => {
         if (changes.network && changes.network !== state.network) {
-          setState((prevState) => ({
-            ...prevState,
-            network: changes.network,
-          }));
+          localStorage.setItem(STORAGE_KEY, changes.network);
+          setState((s) => ({ ...s, network: changes.network }));
+          // trigger immediate refresh when network changes
+          fetchBalances();
         }
       });
-    } catch (error) {
-      console.error("Failed to initialize network watcher:", error);
-    }
+    } catch {}
 
-    // Cleanup function
     return () => {
       if (networkWatcher.current) {
-        try {
-          networkWatcher.current.stop();
-        } catch (error) {
-          console.error("Error stopping network watcher:", error);
-        }
+        try { networkWatcher.current.stop(); } catch {}
         networkWatcher.current = null;
       }
     };
   }, [state.isConnected, state.network]);
 
   const connect = useCallback(async () => {
-    setState((s) => ({ ...s, isLoading: true, error: null }));
+    setState((s) => ({ ...s, isLoading: true, error: null, connectionStatus: "connecting" }));
     try {
+      // set a connection timeout to avoid hanging
+      if (connectTimeoutRef.current) clearTimeout(connectTimeoutRef.current);
+      connectTimeoutRef.current = setTimeout(() => {
+        setState((s) => ({ ...s, isLoading: false, connectionStatus: "error", error: "Connection timed out" }));
+      }, 15000);
       const accessResult = await requestAccess();
       if (accessResult?.error) {
+        if (connectTimeoutRef.current) {
+          clearTimeout(connectTimeoutRef.current);
+          connectTimeoutRef.current = null;
+        }
         setState((s) => ({
           ...s,
           isLoading: false,
           error: accessResult.error ?? "Connection rejected",
+          connectionStatus: "error",
         }));
         return;
       }
-      const [addrResult, netResult] = await Promise.all([
-        getAddress(),
-        getNetwork(),
-      ]);
+      const [addrResult, netResult] = await Promise.all([getAddress(), getNetwork()]);
+      if (connectTimeoutRef.current) {
+        clearTimeout(connectTimeoutRef.current);
+        connectTimeoutRef.current = null;
+      }
+      const network = netResult?.network ?? null;
+      if (network) localStorage.setItem(STORAGE_KEY, network);
       setState((s) => ({
         ...s,
         address: addrResult?.address ?? null,
-        network: netResult?.network ?? null,
+        network,
         isConnected: !!addrResult?.address,
         isLoading: false,
         error: null,
         balanceError: null,
+        connectionStatus: addrResult?.address ? "connected" : "error",
       }));
     } catch (err) {
+      if (connectTimeoutRef.current) {
+        clearTimeout(connectTimeoutRef.current);
+        connectTimeoutRef.current = null;
+      }
       setState((s) => ({
         ...s,
         isLoading: false,
         error: err instanceof Error ? err.message : "Failed to connect wallet",
+        connectionStatus: "error",
       }));
     }
   }, []);
 
+  const reconnect = useCallback(async () => {
+    setState((s) => ({ ...s, error: null, connectionStatus: "connecting" }));
+    await connect();
+  }, [connect]);
+
   const disconnect = useCallback(() => {
-    setState((s) => ({
-      ...s,
-      address: null,
-      network: null,
-      isConnected: false,
-      isLoading: false,
-      error: null,
-      balanceError: null,
-      balances: [],
-      totalUsdValue: 0,
-      isBalancesLoading: false,
-      lastBalanceSync: null,
-    }));
+    localStorage.removeItem(STORAGE_KEY);
+    queryClient.removeQueries({ queryKey: ["balances"] });
+    setState({ ...INITIAL_STATE, connectionStatus: "idle" });
   }, []);
 
   return (
-    <WalletContext.Provider value={{ ...state, connect, disconnect, fetchBalances }}>
+    <WalletContext.Provider value={{ ...state, connect, disconnect, reconnect, fetchBalances }}>
       {children}
     </WalletContext.Provider>
   );
