@@ -8,6 +8,8 @@ import { AuditLogInterceptor } from './common/interceptors/audit-log.interceptor
 import { RequestLoggingInterceptor } from './common/interceptors/request-logging.interceptor';
 import { GracefulShutdownInterceptor } from './common/interceptors/graceful-shutdown.interceptor';
 import { TieredThrottlerGuard } from './common/guards/tiered-throttler.guard';
+import { ApmModule } from './modules/apm/apm.module';
+import { ApmInterceptor } from './modules/apm/apm.interceptor';
 import { CommonModule } from './common/common.module';
 import { EventEmitterModule } from '@nestjs/event-emitter';
 import { LoggerModule } from 'nestjs-pino';
@@ -47,6 +49,7 @@ import { ConnectionPoolModule } from './common/database/connection-pool.module';
 import { CircuitBreakerModule } from './common/circuit-breaker/circuit-breaker.module';
 import { PostmanModule } from './common/postman/postman.module';
 import { CorrelationIdMiddleware } from './common/middleware/correlation-id.middleware';
+import { RequestValidationMiddleware } from './common/middleware/validation.middleware';
 import { PerformanceModule } from './modules/performance/performance.module';
 import { GracefulShutdownService } from './common/services/graceful-shutdown.service';
 
@@ -95,6 +98,9 @@ const envValidationSchema = Joi.object({
   BACKUP_ENCRYPTION_KEY: Joi.string().length(64).optional(), // 32-byte key as hex
   BACKUP_RETENTION_DAYS: Joi.number().integer().min(1).default(30).optional(),
   BACKUP_TMP_DIR: Joi.string().optional(),
+
+  APM_SAMPLING_RATE: Joi.number().min(0).max(1).default(1.0).optional(),
+  APM_ENABLED: Joi.boolean().default(true).optional(),
 });
 
 @Module({
@@ -209,6 +215,7 @@ const envValidationSchema = Joi.object({
     DataExportModule,
     ConnectionPoolModule,
     CircuitBreakerModule,
+    ApmModule,
     PostmanModule,
     PerformanceModule,
     CommonModule,
@@ -254,10 +261,15 @@ const envValidationSchema = Joi.object({
       provide: APP_INTERCEPTOR,
       useClass: GracefulShutdownInterceptor,
     },
+    {
+      provide: APP_INTERCEPTOR,
+      useClass: ApmInterceptor,
+    },
   ],
 })
 export class AppModule {
   configure(consumer: MiddlewareConsumer) {
     consumer.apply(CorrelationIdMiddleware).forRoutes('*');
+    consumer.apply(RequestValidationMiddleware).forRoutes('*');
   }
 }
