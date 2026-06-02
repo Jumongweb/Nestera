@@ -1,6 +1,8 @@
 import { Injectable } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 import { Repository, SelectQueryBuilder } from 'typeorm';
+import { Readable } from 'stream';
+import { format as csvFormat } from '@fast-csv/format';
 import { LedgerTransaction } from '../blockchain/entities/transaction.entity';
 import { TransactionQueryDto } from './dto/transaction-query.dto';
 import { TransactionResponseDto } from './dto/transaction-response.dto';
@@ -38,6 +40,60 @@ export class TransactionsService {
     return new PageDto(transformedData, meta);
   }
 
+  async streamTransactionsCsv(
+    userId: string,
+    queryDto: TransactionQueryDto,
+  ): Promise<Readable> {
+    const chunkSize = Number(queryDto.limit ?? 1000);
+    let offset = 0;
+
+    const csvStream = csvFormat({ headers: true, quoteColumns: true });
+
+    (async () => {
+      try {
+        while (true) {
+          const batch = await this.buildQuery(userId, queryDto)
+            .skip(offset)
+            .take(chunkSize)
+            .getMany();
+
+          if (!batch.length) {
+            break;
+          }
+
+          for (const tx of batch) {
+            const dto = this.transformToResponseDto(tx);
+            csvStream.write({
+              id: dto.id,
+              userId: dto.userId,
+              type: dto.type,
+              amount: dto.amount,
+              amountFormatted: dto.amountFormatted?.display ?? '',
+              publicKey: dto.publicKey ?? '',
+              eventId: dto.eventId,
+              transactionHash: dto.transactionHash ?? '',
+              category: dto.category ?? '',
+              tags: dto.tags ? dto.tags.join(';') : '',
+              ledgerSequence: dto.ledgerSequence ?? '',
+              poolId: dto.poolId ?? '',
+              assetId: dto.assetId ?? '',
+              metadata: dto.metadata ? JSON.stringify(dto.metadata) : '',
+              createdAt: dto.createdAt,
+            });
+          }
+
+          offset += chunkSize;
+        }
+      } catch (error) {
+        csvStream.destroy(error);
+      } finally {
+        csvStream.end();
+      }
+    })();
+
+    return csvStream;
+  }
+
   private buildQuery(
     userId: string,
     queryDto: TransactionQueryDto,
@@ -73,6 +129,21 @@ export class TransactionsService {
       });
     }
 
+    // Filter by category
+    if (queryDto.category) {
+      queryBuilder.andWhere('transaction.category = :category', {
+        category: queryDto.category,
+      });
+    }
+
+    // Filter by tags (any overlap)
+    if (queryDto.tags && queryDto.tags.length > 0) {
+      // Use Postgres array overlap operator (&&)
+      queryBuilder.andWhere('transaction.tags && :tags', {
+        tags: queryDto.tags,
+      });
+    }
+
     // Apply ordering
     queryBuilder.orderBy('transaction.createdAt', queryDto.order ?? 'DESC');
 
@@ -84,6 +155,9 @@ export class TransactionsService {
   ): TransactionResponseDto {
     const createdAt = new Date(transaction.createdAt);
 
+    // Extract asset ID from metadata or use default USDC
+    const assetId = this.extractAssetId(transaction);
+
     return {
       id: transaction.id,
       userId: transaction.userId,
@@ -92,6 +166,8 @@ export class TransactionsService {
       publicKey: transaction.publicKey,
       eventId: transaction.eventId,
       transactionHash: transaction.transactionHash,
+      category: transaction.category ?? null,
+      tags: transaction.tags ?? [],
       ledgerSequence: transaction.ledgerSequence,
       poolId: transaction.poolId,
       metadata: transaction.metadata,
@@ -106,6 +182,108 @@ export class TransactionsService {
         minute: '2-digit',
         second: '2-digit',
       }),
-    };
+      // Add assetId for interceptor formatting (will be enriched by interceptor)
+      assetId,
+    } as TransactionResponseDto;
+  }
+
+  async tagTransaction(userId: string, transactionId: string, payload: any) {
+    const tx = await this.transactionRepository.findOne({
+      where: { id: transactionId, userId },
+    });
+
+    if (!tx) {
+      return { ok: false, message: 'Transaction not found' };
+    }
+
+    // Handle tags
+    if (payload?.tags) {
+      const current = tx.tags ?? [];
+      const incoming = Array.isArray(payload.tags) ? payload.tags : [];
+
+      if (payload.action === 'remove') {
+        tx.tags = current.filter((t) => !incoming.includes(t));
+      } else if (payload.action === 'set') {
+        tx.tags = incoming;
+      } else {
+        // add
+        const set = new Set(current.concat(incoming));
+        tx.tags = Array.from(set);
+      }
+    }
+
+    if (typeof payload?.category === 'string') {
+      tx.category = payload.category;
+    }
+
+    await this.transactionRepository.save(tx);
+
+    return { ok: true, transaction: this.transformToResponseDto(tx) };
+  }
+
+  async listCategories(userId: string) {
+    const rows = await this.transactionRepository
+      .createQueryBuilder('transaction')
+      .select('DISTINCT transaction.category', 'category')
+      .where('transaction.userId = :userId', { userId })
+      .andWhere('transaction.category IS NOT NULL')
+      .orderBy('transaction.category', 'ASC')
+      .getRawMany();
+
+    return rows.map((r) => r.category);
+  }
+
+  async bulkTag(userId: string, body: any) {
+    // Support ids-based operations for now
+    if (!body?.ids || !Array.isArray(body.ids) || !body.ids.length) {
+      return { ok: false, message: 'No ids provided' };
+    }
+
+    const txs = await this.transactionRepository.findBy({
+      id: body.ids,
+      userId,
+    });
+
+    for (const tx of txs) {
+      if (body.tags) {
+        const current = tx.tags ?? [];
+        const incoming = Array.isArray(body.tags) ? body.tags : [];
+
+        if (body.action === 'remove') {
+          tx.tags = current.filter((t) => !incoming.includes(t));
+        } else if (body.action === 'set') {
+          tx.tags = incoming;
+        } else {
+          const set = new Set(current.concat(incoming));
+          tx.tags = Array.from(set);
+        }
+      }
+
+      if (typeof body.category === 'string') {
+        tx.category = body.category;
+      }
+    }
+
+    await this.transactionRepository.save(txs);
+
+    return { ok: true, count: txs.length };
+  }
+
+  /**
+   * Extract asset ID from transaction metadata or return default
+   */
+  private extractAssetId(transaction: LedgerTransaction): string {
+    // Check metadata for asset information
+    if (transaction.metadata?.assetId) {
+      return transaction.metadata.assetId as string;
+    }
+
+    if (transaction.metadata?.contractId) {
+      return transaction.metadata.contractId as string;
+    }
+
+    // Check if poolId corresponds to a known asset
+    // For now, default to USDC as it's the primary asset
+    return 'CBIELTK6YBZJU5UP2WWQEUCYKLPU6AUNZ2BQ4WWFEIE3USCIHMXQDAMA';
   }
 }

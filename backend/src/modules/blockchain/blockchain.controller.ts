@@ -1,12 +1,18 @@
 import { Controller, Get, Param, Post } from '@nestjs/common';
 import { ApiOperation, ApiParam, ApiResponse, ApiTags } from '@nestjs/swagger';
 import { StellarService } from './stellar.service';
+import { BalanceSyncService } from './balance-sync.service';
+import { IndexerService } from './indexer.service';
 import { TransactionDto } from './dto/transaction.dto';
 
 @ApiTags('Blockchain')
 @Controller('blockchain')
 export class BlockchainController {
-  constructor(private readonly stellarService: StellarService) {}
+  constructor(
+    private readonly stellarService: StellarService,
+    private readonly balanceSyncService: BalanceSyncService,
+    private readonly indexerService: IndexerService,
+  ) {}
 
   @Post('wallets/generate')
   @ApiOperation({ summary: 'Generate a new Stellar keypair' })
@@ -47,5 +53,31 @@ export class BlockchainController {
   })
   getRpcStatus() {
     return this.stellarService.getEndpointsStatus();
+  }
+
+  @Get('balance-sync/metrics')
+  @ApiOperation({
+    summary: 'Get WebSocket connection health metrics for balance sync',
+  })
+  @ApiResponse({
+    status: 200,
+    description: 'Connection metrics summary for all subscribed accounts',
+  })
+  getBalanceSyncMetrics() {
+    return this.balanceSyncService.getMetricsSummary();
+  }
+
+  @Get('indexer/status')
+  @ApiOperation({ summary: 'Get contract event indexer status for monitoring dashboard' })
+  @ApiResponse({ status: 200, description: 'Indexer state including ledger position, event counts, and monitored contracts' })
+  getIndexerStatus() {
+    const state = this.indexerService.getIndexerState();
+    return {
+      lastProcessedLedger: state?.lastProcessedLedger ?? 0,
+      lastProcessedTimestamp: state?.lastProcessedTimestamp ?? null,
+      totalEventsProcessed: state?.totalEventsProcessed ?? 0,
+      totalEventsFailed: state?.totalEventsFailed ?? 0,
+      monitoredContracts: this.indexerService.getMonitoredContracts(),
+    };
   }
 }

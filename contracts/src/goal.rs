@@ -94,12 +94,32 @@ pub fn create_goal_save(
     add_goal_to_user(env, &user, goal_id);
     increment_next_goal_id(env);
 
+    // Update user's total balance
+    let user_key = DataKey::User(user.clone());
+    if let Some(mut user_data) = env.storage().persistent().get::<DataKey, User>(&user_key) {
+        user_data.total_balance = user_data
+            .total_balance
+            .checked_add(net_initial_deposit)
+            .ok_or(SavingsError::Overflow)?;
+        user_data.savings_count = user_data
+            .savings_count
+            .checked_add(1)
+            .ok_or(SavingsError::Overflow)?;
+        env.storage().persistent().set(&user_key, &user_data);
+    }
+
     // Award deposit points
     storage::award_deposit_points(env, user.clone(), initial_deposit)?;
 
     // Extend TTL for new goal save and user data
     ttl::extend_goal_ttl(env, goal_id);
     ttl::extend_user_plan_list_ttl(env, &DataKey::UserGoalSaves(user.clone()));
+
+    // Emit goal-created event
+    env.events().publish(
+        (symbol_short!("goal_new"), user, goal_id),
+        (goal_name, target_amount),
+    );
 
     Ok(goal_id)
 }
@@ -153,6 +173,16 @@ pub fn deposit_to_goal_save(
         .persistent()
         .set(&DataKey::GoalSave(goal_id), &goal_save);
 
+    // Update user's total balance
+    let user_key = DataKey::User(user.clone());
+    if let Some(mut user_data) = env.storage().persistent().get::<DataKey, User>(&user_key) {
+        user_data.total_balance = user_data
+            .total_balance
+            .checked_add(net_amount)
+            .ok_or(SavingsError::Overflow)?;
+        env.storage().persistent().set(&user_key, &user_data);
+    }
+
     if !was_completed && goal_save.is_completed {
         storage::award_goal_completion_bonus(env, user.clone())?;
     }
@@ -160,6 +190,12 @@ pub fn deposit_to_goal_save(
     // Extend TTL on deposit
     ttl::extend_goal_ttl(env, goal_id);
     ttl::extend_user_ttl(env, &user);
+
+    // Emit deposit event
+    env.events().publish(
+        (symbol_short!("goal_dep"), user.clone(), goal_id),
+        net_amount,
+    );
 
     // Transfer fee to treasury if fee > 0
     if fee_amount > 0 {
@@ -240,8 +276,8 @@ pub fn withdraw_completed_goal_save(
     if let Some(mut user_data) = env.storage().persistent().get::<DataKey, User>(&user_key) {
         user_data.total_balance = user_data
             .total_balance
-            .checked_add(net_amount)
-            .ok_or(SavingsError::Overflow)?;
+            .checked_sub(goal_save.current_amount)
+            .ok_or(SavingsError::Underflow)?;
         env.storage().persistent().set(&user_key, &user_data);
     }
 
@@ -274,6 +310,12 @@ pub fn withdraw_completed_goal_save(
         // Record fee in treasury struct
         crate::treasury::record_fee(env, fee_amount, soroban_sdk::Symbol::new(env, "withdraw"));
     }
+
+    // Emit withdrawal event
+    env.events().publish(
+        (symbol_short!("goal_wth"), user, goal_id),
+        net_amount,
+    );
 
     Ok(net_amount)
 }
@@ -335,8 +377,8 @@ pub fn break_goal_save(env: &Env, user: Address, goal_id: u64) -> Result<i128, S
     if let Some(mut user_data) = env.storage().persistent().get::<DataKey, User>(&user_key) {
         user_data.total_balance = user_data
             .total_balance
-            .checked_add(net_amount)
-            .ok_or(SavingsError::Overflow)?;
+            .checked_sub(goal_save.current_amount)
+            .ok_or(SavingsError::Underflow)?;
         env.storage().persistent().set(&user_key, &user_data);
     }
 

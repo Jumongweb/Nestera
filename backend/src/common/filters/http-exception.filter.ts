@@ -14,6 +14,15 @@ import { Request, Response } from 'express';
  */
 const RPC_TIMEOUT_PATTERN = /request timeout after \d+ms/i;
 const RPC_EXHAUSTED_PATTERN = /all \w+ rpc endpoints failed/i;
+const DB_CONNECTION_PATTERNS = [
+  /econnrefused/i,
+  /enotfound/i,
+  /connection terminated unexpectedly/i,
+  /password authentication failed/i,
+  /failed to connect/i,
+  /connection timeout/i,
+  /connect etimedout/i,
+];
 
 /** Classify an unknown exception as an RPC-layer error. */
 function isRpcFallbackError(exception: unknown): exception is Error {
@@ -21,6 +30,25 @@ function isRpcFallbackError(exception: unknown): exception is Error {
   return (
     RPC_TIMEOUT_PATTERN.test(exception.message) ||
     RPC_EXHAUSTED_PATTERN.test(exception.message)
+  );
+}
+
+function isDatabaseConnectionError(exception: unknown): exception is Error {
+  if (!(exception instanceof Error)) return false;
+
+  const message = exception.message || '';
+  const code = (exception as Error & { code?: string }).code || '';
+
+  return (
+    DB_CONNECTION_PATTERNS.some((pattern) => pattern.test(message)) ||
+    [
+      'ECONNREFUSED',
+      'ENOTFOUND',
+      'ETIMEDOUT',
+      '57P01',
+      '08001',
+      '08006',
+    ].includes(code)
   );
 }
 
@@ -65,6 +93,26 @@ export class AllExceptionsFilter implements ExceptionFilter {
       });
     }
 
+    // ── Database connectivity errors ────────────────────────────────────────
+    if (isDatabaseConnectionError(exception)) {
+      const statusCode = HttpStatus.SERVICE_UNAVAILABLE;
+
+      this.logger.error(
+        `[DB Connection] ${request.method} ${request.url} → ${statusCode} | ${exception.message}`,
+        exception.stack,
+      );
+
+      return response.status(statusCode).json({
+        success: false,
+        statusCode,
+        errorCode: 'DB_CONNECTION_ERROR',
+        timestamp: new Date().toISOString(),
+        path: request.url,
+        message:
+          'Database connection is currently unavailable. Please try again shortly.',
+      });
+    }
+
     // ── Standard HTTP exceptions ─────────────────────────────────────────────
     const status =
       exception instanceof HttpException
@@ -72,6 +120,7 @@ export class AllExceptionsFilter implements ExceptionFilter {
         : HttpStatus.INTERNAL_SERVER_ERROR;
 
     let message: string;
+    let errors: any[] = [];
     if (exception instanceof HttpException) {
       const exceptionResponse = exception.getResponse();
       if (typeof exceptionResponse === 'string') {
@@ -80,10 +129,15 @@ export class AllExceptionsFilter implements ExceptionFilter {
         typeof exceptionResponse === 'object' &&
         exceptionResponse !== null
       ) {
-        const msg = (exceptionResponse as Record<string, unknown>).message;
+        const responseData = exceptionResponse as Record<string, unknown>;
+        const msg = responseData.message;
         message = Array.isArray(msg)
           ? msg.join('; ')
           : String(msg ?? 'An error occurred');
+
+        if (Array.isArray(responseData.errors)) {
+          errors = responseData.errors;
+        }
       } else {
         message = 'An error occurred';
       }
@@ -91,7 +145,7 @@ export class AllExceptionsFilter implements ExceptionFilter {
       message = status >= 500 ? 'Internal server error' : 'An error occurred';
     }
 
-    const errorResponse = {
+    const errorResponse: any = {
       success: false,
       statusCode: status,
       timestamp: new Date().toISOString(),
@@ -101,6 +155,10 @@ export class AllExceptionsFilter implements ExceptionFilter {
           ? (message as { message?: string }).message
           : message,
     };
+
+    if (errors.length > 0) {
+      errorResponse.errors = errors;
+    }
 
     if (status >= 500) {
       this.logger.error(

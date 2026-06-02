@@ -3,6 +3,8 @@ import {
   ConflictException,
   UnauthorizedException,
   BadRequestException,
+  Inject,
+  forwardRef,
 } from '@nestjs/common';
 import { JwtService } from '@nestjs/jwt';
 import { UserService } from '../modules/user/user.service';
@@ -12,18 +14,20 @@ import {
   VerifySignatureDto,
   LinkWalletDto,
 } from './dto/auth.dto';
-// import { Cache } from 'cache-manager';
-// import { CACHE_MANAGER } from '@nestjs/cache-manager';
+import { Cache } from 'cache-manager';
+import { CACHE_MANAGER } from '@nestjs/cache-manager';
 import * as bcrypt from 'bcrypt';
 import { randomUUID } from 'crypto';
 import * as StellarSdk from '@stellar/stellar-sdk';
+import { EventEmitter2 } from '@nestjs/event-emitter';
 
 @Injectable()
 export class AuthService {
   constructor(
     private readonly userService: UserService,
     private readonly jwtService: JwtService,
-    // @Inject(CACHE_MANAGER) private cacheManager: Cache,
+    private readonly eventEmitter: EventEmitter2,
+    @Inject(CACHE_MANAGER) private cacheManager: Cache,
   ) {}
 
   async register(dto: RegisterDto) {
@@ -38,6 +42,14 @@ export class AuthService {
       password: hashedPassword,
     });
 
+    // Apply referral code if provided
+    if (dto.referralCode) {
+      this.eventEmitter.emit('user.signup-with-referral', {
+        userId: user.id,
+        referralCode: dto.referralCode,
+      });
+    }
+
     return {
       user,
       accessToken: this.generateToken(user.id, user.email, user.role),
@@ -50,8 +62,23 @@ export class AuthService {
       throw new UnauthorizedException('Invalid credentials');
     }
 
+    // Check if 2FA is enabled
+    const fullUser = await this.userService.findByEmail(dto.email);
+    if (fullUser?.twoFactorEnabled) {
+      return {
+        requiresTwoFactor: true,
+        userId: user.id,
+        message: 'Please provide your 2FA token',
+      };
+    }
+
     return {
-      accessToken: this.generateToken(user.id, user.email, user.role),
+      accessToken: this.generateToken(
+        user.id,
+        user.email,
+        user.role,
+        user.kycStatus,
+      ),
     };
   }
 
@@ -64,19 +91,40 @@ export class AuthService {
     return null;
   }
 
-  private generateToken(userId: string, email: string, role = 'USER') {
-    return this.jwtService.sign({ sub: userId, email, role });
+  private generateToken(
+    userId: string,
+    email: string,
+    role = 'USER',
+    kycStatus = 'NOT_SUBMITTED',
+  ) {
+    return this.jwtService.sign({ sub: userId, email, role, kycStatus });
   }
 
   async generateNonce(publicKey: string): Promise<{ nonce: string }> {
-    // Validate Stellar public key format
     if (!StellarSdk.StrKey.isValidEd25519PublicKey(publicKey)) {
       throw new BadRequestException('Invalid Stellar public key format');
     }
 
+    const rateLimitKey = `nonce:ratelimit:${publicKey}`;
+    const rateLimitCount = await this.cacheManager.get<number>(rateLimitKey);
+    if (
+      rateLimitCount !== undefined &&
+      rateLimitCount !== null &&
+      rateLimitCount >= 5
+    ) {
+      throw new UnauthorizedException('Too many nonce requests');
+    }
+
+    const newCount = (rateLimitCount ?? 0) + 1;
+    await this.cacheManager.set(rateLimitKey, newCount, 900000);
+
     const nonce = randomUUID();
-    // const cacheKey = `nonce:${publicKey}`;
-    // await this.cacheManager.set(cacheKey, nonce, 300000); // 300 seconds = 5 minutes
+    const cacheKey = `nonce:${publicKey}`;
+    await this.cacheManager.set(
+      cacheKey,
+      { nonce, timestamp: Date.now() },
+      300000,
+    );
 
     return { nonce };
   }
@@ -86,41 +134,43 @@ export class AuthService {
   ): Promise<{ accessToken: string }> {
     const { publicKey, signature, nonce } = dto;
 
-    // Validate public key format
     if (!StellarSdk.StrKey.isValidEd25519PublicKey(publicKey)) {
       throw new BadRequestException('Invalid Stellar public key format');
     }
 
-    // Retrieve stored nonce
-    // const cacheKey = `nonce:${publicKey}`;
-    // const storedNonce = await this.cacheManager.get<string>(cacheKey);
-    const storedNonce = nonce; // Temporarily bypass cache for testing
-
-    if (!storedNonce) {
-      throw new UnauthorizedException(
-        'Nonce not found or expired. Request a new nonce.',
-      );
+    const cacheKey = `nonce:${publicKey}`;
+    const stored = await this.cacheManager.get<{
+      nonce: string;
+      timestamp: number;
+    }>(cacheKey);
+    if (!stored) {
+      throw new UnauthorizedException('Nonce not found or expired');
     }
 
-    // Verify signature
+    if (Date.now() - stored.timestamp > 300000) {
+      await this.cacheManager.del(cacheKey);
+      throw new UnauthorizedException('Nonce not found or expired');
+    }
+
+    if (stored.nonce !== nonce) {
+      throw new UnauthorizedException('Nonce mismatch');
+    }
+
     const isValidSignature = this.verifyWalletSignature(
       publicKey,
       signature,
-      storedNonce,
+      nonce,
     );
 
     if (!isValidSignature) {
       throw new UnauthorizedException('Invalid signature');
     }
 
-    // Consume the nonce (delete it)
-    // await this.cacheManager.del(cacheKey);
+    await this.cacheManager.del(cacheKey);
 
-    // Find or create user by public key
     let user = await this.userService.findByPublicKey(publicKey);
 
     if (!user) {
-      // Create new user with public key
       user = await this.userService.create({
         publicKey,
         email: `${publicKey.substring(0, 10)}@stellar.wallet`,
@@ -133,47 +183,48 @@ export class AuthService {
     };
   }
 
-  /**
-   * Link a Stellar wallet to an already-authenticated email account.
-   *
-   * Flow:
-   *  1. Caller fetches a nonce via GET /auth/nonce?publicKey=<key>
-   *  2. Caller signs the nonce with the wallet's Ed25519 secret key
-   *  3. Caller POSTs { publicKey, nonce, signature } + Bearer JWT to this endpoint
-   *
-   * The method:
-   *  - Validates the Stellar key format
-   *  - Verifies the Ed25519 signature (same logic as verifySignature)
-   *  - Delegates to UserService.linkWallet, which enforces uniqueness at the DB row level
-   *
-   * @param userId   Extracted from the verified JWT by JwtAuthGuard
-   * @param dto      LinkWalletDto from request body
-   */
   async linkWallet(
     userId: string,
     dto: LinkWalletDto,
-  ): Promise<{ publicKey: string; message: string }> {
+  ): Promise<{ walletAddress: string; message: string }> {
     const { publicKey, nonce, signature } = dto;
 
-    // 1. Validate Stellar public key format
     if (!StellarSdk.StrKey.isValidEd25519PublicKey(publicKey)) {
       throw new BadRequestException('Invalid Stellar public key format');
     }
 
-    // 2. Verify the Ed25519 signature over the nonce
-    //    This proves the caller controls the private key behind publicKey.
-    const isValid = this.verifyWalletSignature(publicKey, signature, nonce);
-    if (!isValid) {
-      throw new UnauthorizedException(
-        'Signature verification failed. Ensure you signed the exact nonce bytes.',
-      );
+    const cacheKey = `nonce:${publicKey}`;
+    const stored = await this.cacheManager.get<{
+      nonce: string;
+      timestamp: number;
+    }>(cacheKey);
+    if (!stored) {
+      throw new UnauthorizedException('Nonce not found or expired');
     }
 
-    // 3. Persist the link; UserService throws ConflictException on duplicates
-    const updatedUser = await this.userService.linkWallet(userId, publicKey);
+    if (Date.now() - stored.timestamp > 300000) {
+      await this.cacheManager.del(cacheKey);
+      throw new UnauthorizedException('Nonce has expired');
+    }
+
+    if (stored.nonce !== nonce) {
+      throw new UnauthorizedException('Nonce mismatch');
+    }
+
+    const isValid = this.verifyWalletSignature(publicKey, signature, nonce);
+    if (!isValid) {
+      throw new UnauthorizedException('Signature verification failed');
+    }
+
+    await this.cacheManager.del(cacheKey);
+
+    const updatedUser = await this.userService.linkWalletAddress(
+      userId,
+      publicKey,
+    );
 
     return {
-      publicKey: updatedUser.publicKey!,
+      walletAddress: updatedUser.walletAddress,
       message: 'Wallet linked successfully',
     };
   }
